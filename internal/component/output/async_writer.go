@@ -54,7 +54,9 @@ type AsyncWriter struct {
 
 	transactions <-chan message.Transaction
 
-	shutSig *shutdown.Signaller
+	shutSig          *shutdown.Signaller
+	lifecycleOnce    sync.Once
+	prestartCloseErr error // Published before the stopped signal.
 }
 
 // NewAsyncWriter creates a Streamed implementation around an AsyncSink.
@@ -251,11 +253,15 @@ func (w *AsyncWriter) loop() {
 
 // Consume assigns a messages channel for the output to read.
 func (w *AsyncWriter) Consume(ts <-chan message.Transaction) error {
-	if w.transactions != nil {
+	started := false
+	w.lifecycleOnce.Do(func() {
+		started = true
+		w.transactions = ts
+		go w.loop()
+	})
+	if !started {
 		return component.ErrAlreadyStarted
 	}
-	w.transactions = ts
-	go w.loop()
 	return nil
 }
 
@@ -269,6 +275,15 @@ func (w *AsyncWriter) ConnectionStatus() component.ConnectionStatuses {
 // TriggerCloseNow shuts down the output and stops processing messages.
 func (w *AsyncWriter) TriggerCloseNow() {
 	w.shutSig.TriggerHardStop()
+	w.lifecycleOnce.Do(func() {
+		go func() {
+			// A constructed sink may own resources even though Connect was never
+			// called. Close it directly rather than starting a writer loop.
+			w.prestartCloseErr = w.writer.Close(context.Background())
+			w.connection.Store(component.ConnectionClosed(w.mgr))
+			w.shutSig.TriggerHasStopped()
+		}()
+	})
 }
 
 // WaitForClose blocks until the File output has closed down.
@@ -278,7 +293,7 @@ func (w *AsyncWriter) WaitForClose(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
+	return w.prestartCloseErr
 }
 
 func sleepWithCancellation(ctx context.Context, d time.Duration) error {

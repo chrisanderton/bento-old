@@ -3,7 +3,7 @@
 Base: upstream Bento v1.21.1, commit
 `008754ec1e4dbd700000314561e2b3e2fddbe6b8`.
 
-This temporary fork contains four generic lifecycle corrections and their
+This temporary fork contains generic lifecycle corrections and their
 regression tests:
 
 1. Synchronize cancellation notifications in `autoretry.List.Shift` so a reader
@@ -16,6 +16,13 @@ regression tests:
    Repeated and concurrent `Close` calls perform that cleanup once.
 4. Make concurrent CloudWatch `Close` calls join one final upload and retain its
    result, rather than letting a second caller cancel the first upload.
+5. Join already-built resources when pipeline or component construction fails.
+   Preserve cleanup ownership across pipeline, buffer, asynchronous output,
+   wrapped input, broker, sequence, dynamic-input and tracing layers.
+   An interrupted wait retains ownership so a fresh caller can complete cleanup.
+6. Distinguish completed dynamic-input cleanup errors from interrupted waits.
+   Replacement logs completed cleanup errors and proceeds; whole-stream shutdown
+   retains those errors for its caller. An interrupted wait does not permit replacement.
 
 These changes add no Tyk product feature, custom connector, processor, configuration
 field, broker acknowledgement policy or timeout. Existing exporter upload-error
@@ -32,8 +39,11 @@ a caller-deadline guarantee. InfluxDB's configured ping timeout does not bound i
 HTTP writes. Optional InfluxDB runtime/GC collectors and CloudWatch's periodic
 flush loop are not joined by these changes.
 
-The startup correction is not a general fix for every partially constructed
-pipeline or component. It reuses Stream's existing resource-cleanup path.
+Partial-construction cleanup uses the existing component owners and shutdown paths.
+It can wait for a component that does not finish cleanup; no new timeout is added.
+The retained regressions cover the corrected ownership layers, not every connector.
+An interrupted shutdown may report only errors collected before cancellation.
+A fresh caller can join the remaining cleanup.
 
 ## Return to upstream
 
@@ -55,6 +65,8 @@ go test -race ./public/service -run '^TestRetryReadCancellationDuringBackoff$' -
 go test -race ./public/service -run '^TestStream(FailedStartupClosesResources|StopBeforeRunPreservesResources|FailedStartupCleanupCanBeJoinedLater)$' -count=20 -timeout=1m
 go test -race ./internal/impl/influxdb ./internal/impl/aws -run '^(TestInfluxClose|TestCloudWatchConcurrentClose|TestCloudWatchCloseRetains)' -count=20 -timeout=45s
 go test -race ./internal/autoretry -count=1 -timeout=1m
+go test -race ./internal/bundle/strict ./internal/bundle/tracing ./internal/pipeline ./internal/stream ./public/service -count=1 -timeout=3m
+go test -race ./internal/impl/pure ./internal/impl/io -run '^(TestInputWait|TestSequenceShutdown|TestDynamicReplacement|TestDynamicShutdown|TestDynamicHardStop|TestBroker)' -count=1 -timeout=1m
 ```
 
 The complete AWS race suite has separate baseline S3 test-fixture races in
@@ -63,3 +75,8 @@ The complete AWS race suite has separate baseline S3 test-fixture races in
 `TestS3StreamingWriterExactly5MBTimer`. They reproduce without these corrections
 and are not fixed here. Focused exporter checks are not a claim that the full
 AWS race suite passes.
+
+The full I/O suite also has separate baseline failures in TestFSEventBasic,
+TestFSEventDeleteFile and TestFSEventWatchNewSubdirs, including races in the
+unchanged filesystem-watcher input. They reproduce without these corrections
+and are not fixed here. Focused lifecycle checks do not make that suite green.
